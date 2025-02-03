@@ -1,0 +1,114 @@
+import express from 'express';
+import http from 'http';
+import { Server } from 'socket.io';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import { findMatch } from './services/matchingService.js';
+import { pool } from './db/init.js';
+
+dotenv.config();
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "http://localhost:3000",
+    methods: ["GET", "POST"]
+  }
+});
+
+app.use(cors());
+app.use(express.json());
+
+// Store active users and their sockets
+const activeUsers = new Map();
+
+io.on('connection', (socket) => {
+  console.log('User connected:', socket.id);
+
+  socket.on('findMatch', async ({ userId, displayName, photoURL, interests }) => {
+    try {
+      console.log('Finding match for user:', userId, 'with interests:', interests);
+      
+      // Store user's socket
+      activeUsers.set(userId, socket);
+
+      // Update user's online status
+      await pool.query(
+        'UPDATE users SET online_status = true WHERE firebase_uid = $1',
+        [userId]
+      );
+
+      // Find a match
+      const match = await findMatch(userId, interests);
+      
+      if (match) {
+        const matchedSocket = activeUsers.get(match.matchedUser.id);
+        
+        if (matchedSocket) {
+          // Emit to both users
+          socket.emit('matchFound', {
+            roomId: match.roomId,
+            matchedUser: match.matchedUser,
+            icebreaker: match.icebreaker
+          });
+          
+          matchedSocket.emit('matchFound', {
+            roomId: match.roomId,
+            matchedUser: {
+              id: userId,
+              displayName,
+              photoURL,
+              commonInterests: match.matchedUser.commonInterests
+            },
+            icebreaker: match.icebreaker
+          });
+        }
+      } else {
+        socket.emit('enterQueue', { 
+          message: 'Searching for a match...' 
+        });
+      }
+    } catch (error) {
+      console.error('Error in findMatch:', error);
+      socket.emit('error', { 
+        message: 'Error finding match' 
+      });
+    }
+  });
+
+  socket.on('cancelMatch', async ({ userId }) => {
+    try {
+      activeUsers.delete(userId);
+      await pool.query(
+        'UPDATE users SET online_status = false WHERE firebase_uid = $1',
+        [userId]
+      );
+    } catch (error) {
+      console.error('Error in cancelMatch:', error);
+    }
+  });
+
+  socket.on('disconnect', async () => {
+    try {
+      // Find and remove disconnected user
+      for (const [userId, userSocket] of activeUsers.entries()) {
+        if (userSocket === socket) {
+          activeUsers.delete(userId);
+          await pool.query(
+            'UPDATE users SET online_status = false WHERE firebase_uid = $1',
+            [userId]
+          );
+          break;
+        }
+      }
+    } catch (error) {
+      console.error('Error in disconnect:', error);
+    }
+  });
+});
+
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+}); 
